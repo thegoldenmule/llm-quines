@@ -47,8 +47,8 @@ function intEnv(name: string, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
-const JUDGE_EFFORT = (process.env.QUINER_JUDGE_EFFORT ?? 'medium') as Effort;
-const JUDGE_MODEL = process.env.QUINER_JUDGE_MODEL || undefined;
+const JUDGE_EFFORT = (process.env.QUINER_JUDGE_EFFORT ?? 'high') as Effort;
+const JUDGE_MODEL = process.env.QUINER_JUDGE_MODEL || 'opus';
 const JUDGE_TIMEOUT_MS = intEnv('QUINER_JUDGE_TIMEOUT_MS', 5 * 60 * 1000);
 const JUDGE_RETRIES = intEnv('QUINER_JUDGE_RETRIES', 2);
 

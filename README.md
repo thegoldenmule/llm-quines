@@ -81,16 +81,16 @@ Claude Code session).
 
 | var | default | meaning |
 | --- | --- | --- |
-| `QUINER_EFFORT` | `medium` | `--effort` for claude sessions (`low`/`medium`/`high`/`max`) |
-| `QUINER_MODEL` | CLI default | `--model` override |
+| `QUINER_EFFORT` | `max` | `--effort` for generator sessions (`low`/`medium`/`high`/`max`) |
+| `QUINER_MODEL` | `fable` | `--model` for generator sessions |
 | `QUINER_MAX_ATTEMPTS` | `3` | verification attempts per iteration (feedback via `--resume`) |
 | `QUINER_SESSION_TIMEOUT_MS` | `900000` | wall-clock kill for one claude session |
 | `QUINER_DELAY_MS` | `2000` | pause between iterations |
 | `QUINER_MAX_ITERATIONS` | ∞ | stop after N iterations (smoke tests) |
 | `QUINER_STREAM` | on | set `0` to silence live token streaming |
 | `QUINER_JUDGE` | on | set `0` to disable the LLM interestingness judge |
-| `QUINER_JUDGE_EFFORT` | `medium` | `--effort` for judge sessions |
-| `QUINER_JUDGE_MODEL` | CLI default | `--model` for judge sessions |
+| `QUINER_JUDGE_EFFORT` | `high` | `--effort` for judge sessions |
+| `QUINER_JUDGE_MODEL` | `opus` | `--model` for judge sessions |
 | `QUINER_JUDGE_TIMEOUT_MS` | `300000` | wall-clock kill for one judge session |
 
 ## Notes

@@ -16,8 +16,8 @@ function intEnv(name: string, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
-const EFFORT = (process.env.QUINER_EFFORT ?? 'medium') as Effort;
-const MODEL = process.env.QUINER_MODEL || undefined;
+const EFFORT = (process.env.QUINER_EFFORT ?? 'max') as Effort;
+const MODEL = process.env.QUINER_MODEL || 'fable';
 const MAX_ATTEMPTS = intEnv('QUINER_MAX_ATTEMPTS', 3);
 const SESSION_TIMEOUT_MS = intEnv('QUINER_SESSION_TIMEOUT_MS', 15 * 60 * 1000);
 const STREAM = process.env.QUINER_STREAM !== '0';
