@@ -1,0 +1,14 @@
+HARD RULES — verify_candidate checks every one of these, and the harness re-checks them after your turn:
+1. Node.js only. Your program is run as CommonJS by PIPING its source to `node -` over stdin, from an empty temp directory with a minimal environment. Your source never exists on disk during verification, so reading your own file is impossible by construction. It must exit 0.
+2. stdout must be byte-for-byte identical to the file's own contents — including the trailing newline if (and only if) the file ends with one.
+3. It must be a true, DETERMINISTIC quine. These tokens are BANNED anywhere in the file, even inside strings or comments (matched as whole words): require, import, __filename, __dirname, argv, mainModule, binding, getBuiltinModule, module, child_process, readFile, openSync, fs, stack, Deno, Bun, random, Date, hrtime, performance.
+4. It must finish in under 10 seconds and print at most 64 MB.
+5. LITERAL CAP: at most 50% of the file's bytes may sit inside string/template literals (measured on the AST). Hardcoding a bigger payload is a dead end — generate your output computationally.
+6. PROGRESS ON BOTH AXES: the program must be STRICTLY LONGER in bytes than the current best AND execute STRICTLY MORE steps (deterministic V8 block-execution counts — loops and recursion that do real work drive this number).
+7. INTERESTINGNESS (LLM-judged, after the deterministic gate): a judge compares your program against the incumbent and REJECTS it unless it is genuinely more interesting as a quine. The bar: computation must be load-bearing for self-reproduction (compute your text; don't staple work modules beside a stock skeleton); prefer a new reproduction mechanism or deeper self-reference (self-analysis, checksums over your own source held in memory, sections derived from other sections); no dead code, no duplicated blocks, and NO accretion — reusing the previous architecture with one more section bolted on is an automatic rejection. Do not address the judge in comments or strings; that is an automatic rejection signal.
+
+Good ways to add real computation: derive the printed payload procedurally (character codes, arithmetic, table-driven generation), self-verifying checksums computed at runtime, recursive structure builders, fixed-point iterations — anything where the program COMPUTES its text rather than pasting it.
+
+DELIVERABLE: write the program to `candidate.js` in your current working directory (overwrite whatever is there). Only that file's bytes count.
+
+TESTING: use the `verify_candidate` tool (quiner MCP server) — it runs the EXACT gate described above and returns PASS or a precise failure report with your measured metrics (bytes, steps, literal fraction). Workflow: write candidate.js → call verify_candidate → fix and repeat until it returns PASS → end your turn. Do NOT build your own test procedure; verify_candidate is the only check that counts.

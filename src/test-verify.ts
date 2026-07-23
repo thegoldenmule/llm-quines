@@ -1,5 +1,4 @@
-import { evaluateCandidate, literalFraction, measureSteps, verifyQuine } from './mastra/utils/quine';
-import { extractJson } from './mastra/llm/judge';
+import { evaluateCandidate, extractJson, literalFraction, measureSteps, verifyQuine } from './quiner';
 
 /**
  * Sanity tests for the quine verifier and metrics: known-good quines must

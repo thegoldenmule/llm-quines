@@ -1,8 +1,9 @@
 # quiner
 
-An agent loop that builds ever-larger, ever-more-computational JavaScript quines. Built on
-[Mastra](https://mastra.ai) workflows, with all LLM calls going through the local **Claude
-Code CLI in print mode** (`claude -p`) — no direct Anthropic API calls.
+An agent loop that builds ever-larger, ever-more-computational JavaScript quines. One source
+file (`src/quiner.ts`) plus plain-text prompt templates (`prompts/*.md`), with all LLM calls
+going through the local **Claude Code CLI in print mode** (`claude -p`) — no direct Anthropic
+API calls.
 
 Fitness is two-dimensional: each accepted quine must strictly beat the incumbent in **bytes
 AND executed steps** (deterministic V8 block-execution counts via `NODE_V8_COVERAGE`), with
@@ -17,60 +18,57 @@ On top of the deterministic gate sits a semantic layer: an **LLM interestingness
 clears the gate against the incumbent and rejects it unless it is *genuinely more
 interesting as a quine* — computation must be load-bearing for self-reproduction, accretion
 ("incumbent + one more bolted-on section") is an automatic NO, and self-reference depth
-(programs that analyze/derive/validate their own text at runtime) scores highest. The full
-criteria live in `JUDGE_CRITERIA` in `src/mastra/prompts.ts` and are shown verbatim to both
-the generator and the judge. Rejections feed back into the generator session as critique;
-the verdict (score + reasoning) is recorded in the quine's git commit message. If the judge
-is unavailable (transport failure), acceptance fails open on the deterministic gate with a
-note, so an outage can't wedge the loop.
+(programs that analyze/derive/validate their own text at runtime) scores highest. The
+criteria live in `prompts/judge-criteria.md` and are shown verbatim to both the generator
+and the judge. Rejections feed back into the generator session as critique; the verdict
+(score + reasoning) is recorded in the quine's git commit message. If the judge is
+unavailable, acceptance fails open on the deterministic gate with a note, so an outage
+can't wedge the loop.
 
 ## How it works
 
-Each loop iteration runs a two-step Mastra workflow:
+Each loop iteration (all in `src/quiner.ts`):
 
-1. **generate-and-verify** — spawns `claude -p` (stream-json, permissions skipped) with
+1. **generate + verify** — spawns `claude -p` (stream-json, permissions skipped) with
    `workspace/` as its cwd. Iteration 0 asks for a trivial quine; later iterations show the
-   current best and demand a *strictly longer* one. The agent writes `workspace/candidate.js`
-   and tests it with an explicit MCP tool: each session gets a `quiner` stdio MCP server
-   (`--mcp-config --strict-mcp-config`, see `src/mastra/tools/verify-server.ts`) exposing
-   `verify_candidate`, which runs the *same* verifier the harness uses (current best length
-   baked in) and returns PASS or a precise failure report — so the agent never invents its
-   own test procedure. The harness then verifies
-   independently: bans read-your-own-source tokens (`require`, `import`, `__filename`, `argv`,
-   `fs`, `getBuiltinModule`, …) for fast feedback, then pipes the source to `node -` over
-   stdin (CommonJS) from an empty temp dir with a minimal env and a 10s/64MB limit, and
-   byte-compares stdout to the source. Piping over stdin is the real defense: the source never
-   exists on disk during verification, so no self-read trick can work regardless of
-   obfuscation. Failures resume the same claude session with a precise diff report (up to
-   `QUINER_MAX_ATTEMPTS` tries; if the session died without an id, the retry restates the full
-   task in a fresh session).
-2. **commit-quine** — re-runs the exact gate on the exact bytes, writes
-   `completed/quine-<seq>-<bytes>b-<steps>s.js`, updates `state.json`, and commits both to
-   git. (Legacy files without the `-<steps>s` suffix get their steps measured once at scan
-   time and cached in `state.json`.)
+   current best and demand strict improvement on both axes. The agent writes
+   `workspace/candidate.js` and tests it with an explicit MCP tool: each session gets a
+   `quiner` stdio MCP server (`--mcp-config --strict-mcp-config` — the same file run as
+   `tsx src/quiner.ts verify-server`) exposing `verify_candidate`, which runs the *same*
+   gate the harness uses with the current thresholds baked in. Failures — including judge
+   rejections with their critique — resume the same claude session (up to
+   `QUINER_MAX_ATTEMPTS` tries; if the session died without an id, the retry restates the
+   full task in a fresh session).
+2. **judge** — a separate `claude -p` session applies `prompts/judge-criteria.md` to the
+   candidate vs the incumbent.
+3. **commit** — re-runs the deterministic gate on the exact bytes, writes
+   `completed/quine-<seq>-<bytes>b-<steps>s.js`, updates `state.json`, commits to git, and
+   best-effort pushes to the first configured remote.
 
-Then the loop goes again, forever.
+Prompt templates are read fresh on every use, so editing `prompts/*.md` takes effect on the
+next iteration without restarting the loop. Available templates: `system`, `rules`,
+`bootstrap`, `grow`, `feedback`, `fresh-retry`, `judge`, `judge-criteria` (with `{{var}}`
+placeholders substituted in a single pass, so program text can never inject).
 
 ## Restartability
 
-All durable state is `completed/` + git history; `state.json` is just a cache. Every loop
-turn re-scans `completed/` from scratch, so you can kill the process (Ctrl-C) at any moment
-and `npm start` resumes exactly where it left off — at most the in-flight iteration is lost.
-First Ctrl-C aborts the in-flight claude session (killing its whole process group) and stops
-cleanly; a second one reaps any children and force-exits. Crash-safety details: quine files
-are written atomically (tmp + rename) and `commitQuine` stages `completed/` with `-A`, so a
-quine orphaned by a crash mid-commit is swept into the next commit; commits run with
-`--no-verify --no-gpg-sign` so global hooks/gpg config can't wedge the loop; a `.quiner.pid`
-lock refuses to start a second concurrent loop.
+All durable state is `completed/` + git history; `state.json` is just a cache (it also
+memoizes measured steps for legacy files). Every loop turn re-scans `completed/` from
+scratch, so you can kill the process (Ctrl-C) at any moment and `npm start` resumes exactly
+where it left off — at most the in-flight iteration is lost. First Ctrl-C aborts the
+in-flight claude session (killing its whole process group) and stops cleanly; a second one
+reaps any children and force-exits. Crash-safety details: quine files are written atomically
+(tmp + rename) and staged with `-A`, so a quine orphaned by a crash mid-commit is swept into
+the next commit; commits run with `--no-verify --no-gpg-sign` so global hooks/gpg config
+can't wedge the loop; a `.quiner.pid` lock refuses to start a second concurrent loop.
 
 ## Run
 
 ```sh
 npm install
 npm start            # the loop
-npm run test:verify  # verifier sanity tests
+npm run test:verify  # verifier + metrics sanity tests
 npm run typecheck
-npm run dev          # mastra dev playground (optional)
 ```
 
 Requires the `claude` CLI installed and authenticated. The spawned sessions strip
@@ -93,11 +91,14 @@ Claude Code session).
 | `QUINER_JUDGE_MODEL` | `opus` | `--model` for judge sessions |
 | `QUINER_JUDGE_TIMEOUT_MS` | `300000` | wall-clock kill for one judge session |
 | `QUINER_PUSH` | on | set `0` to skip the best-effort `git push` after each commit |
+| `QUINER_RUN_TIMEOUT_MS` | `10000` | execution limit for candidate verification runs |
 
 ## Notes
 
-- The token blacklist is a guardrail against lazy self-reading cheats, not a security
-  boundary; the same list is spelled out in the generator prompt so every rejection is
-  actionable feedback.
-- `workspace/` is the agent's scratch dir (gitignored, pinned to CommonJS so self-tests match
-  the verifier). `completed/` is append-only history.
+- Verification pipes the candidate's source to `node -` over stdin from an empty temp dir
+  with a minimal env: the source never exists on disk during the validity run, so no
+  self-read trick can work regardless of obfuscation. The banned-token list is a fast,
+  explainable pre-check on top; the same list is spelled out in `prompts/rules.md` so every
+  rejection is actionable feedback.
+- `workspace/` is the agent's scratch dir (gitignored, pinned to CommonJS so self-tests
+  match the verifier). `completed/` is append-only history.
