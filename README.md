@@ -92,6 +92,7 @@ Claude Code session).
 | `QUINER_JUDGE_EFFORT` | `high` | `--effort` for judge sessions |
 | `QUINER_JUDGE_MODEL` | `opus` | `--model` for judge sessions |
 | `QUINER_JUDGE_TIMEOUT_MS` | `300000` | wall-clock kill for one judge session |
+| `QUINER_PUSH` | on | set `0` to skip the best-effort `git push` after each commit |
 
 ## Notes
 

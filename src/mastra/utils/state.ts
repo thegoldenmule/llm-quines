@@ -154,6 +154,29 @@ function git(args: string[]): string {
   }).trim();
 }
 
+const PUSH_ENABLED = process.env.QUINER_PUSH !== '0';
+
+/**
+ * Best-effort push after each commit. A failure (network, auth, no remote)
+ * must never fail the iteration — the commit is safe locally and the next
+ * successful push carries the whole backlog anyway.
+ */
+function pushBestEffort(): void {
+  if (!PUSH_ENABLED) return;
+  try {
+    const remote = git(['remote']).split('\n')[0]?.trim();
+    if (!remote) {
+      console.log('[quiner] no git remote configured — skipping push');
+      return;
+    }
+    git(['push', remote, 'HEAD']);
+    console.log(`[quiner] pushed to ${remote}`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message.split('\n')[0] : String(err);
+    console.warn(`[quiner] WARNING: git push failed (${msg}) — commit is safe locally; next push will retry`);
+  }
+}
+
 export function ensureGitRepo(): void {
   if (!existsSync(join(PROJECT_ROOT, '.git'))) {
     git(['init', '-b', 'main']);
@@ -190,5 +213,6 @@ export function commitQuine(
     '-m', `quine #${seq}: ${byteLength} bytes, ${steps} steps`,
     ...(note ? ['-m', note] : []),
   ]);
+  pushBestEffort();
   return { file: path, byteLength };
 }
