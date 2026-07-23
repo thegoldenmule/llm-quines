@@ -22,6 +22,10 @@ export interface RunClaudeOptions {
   timeoutMs?: number;
   /** Streaming text callback (assistant text deltas), for live logging. */
   onText?: (text: string) => void;
+  /** Called with each tool name the agent invokes, for observability. */
+  onToolUse?: (name: string) => void;
+  /** Path to an MCP config JSON; loaded with --strict-mcp-config. */
+  mcpConfigPath?: string;
   /** Abort signal — kills the child process tree when fired. */
   signal?: AbortSignal;
 }
@@ -79,6 +83,7 @@ export function buildArgs(prompt: string, opts: RunClaudeOptions): string[] {
   if (opts.effort) args.push('--effort', opts.effort);
   if (opts.model) args.push('--model', opts.model);
   if (opts.appendSystemPrompt) args.push('--append-system-prompt', opts.appendSystemPrompt);
+  if (opts.mcpConfigPath) args.push('--mcp-config', opts.mcpConfigPath, '--strict-mcp-config');
   if (opts.resumeSessionId) args.push('--resume', opts.resumeSessionId);
   args.push('-p', prompt);
   return args;
@@ -204,6 +209,7 @@ export function runClaude(
           if (Array.isArray(content)) {
             for (const block of content) {
               if (block.type === 'text' && block.text) lastAssistantText = block.text;
+              if (block.type === 'tool_use' && block.name) opts.onToolUse?.(String(block.name));
             }
           }
         }

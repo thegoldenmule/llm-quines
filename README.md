@@ -11,7 +11,11 @@ Each loop iteration runs a two-step Mastra workflow:
 1. **generate-and-verify** — spawns `claude -p` (stream-json, permissions skipped) with
    `workspace/` as its cwd. Iteration 0 asks for a trivial quine; later iterations show the
    current best and demand a *strictly longer* one. The agent writes `workspace/candidate.js`
-   and can self-test with `node candidate.js | diff - candidate.js`. The harness then verifies
+   and tests it with an explicit MCP tool: each session gets a `quiner` stdio MCP server
+   (`--mcp-config --strict-mcp-config`, see `src/mastra/tools/verify-server.ts`) exposing
+   `verify_candidate`, which runs the *same* verifier the harness uses (current best length
+   baked in) and returns PASS or a precise failure report — so the agent never invents its
+   own test procedure. The harness then verifies
    independently: bans read-your-own-source tokens (`require`, `import`, `__filename`, `argv`,
    `fs`, `getBuiltinModule`, …) for fast feedback, then pipes the source to `node -` over
    stdin (CommonJS) from an empty temp dir with a minimal env and a 10s/64MB limit, and

@@ -1,10 +1,10 @@
 import { createStep, createWorkflow } from '@mastra/core/workflows';
 import { z } from 'zod';
-import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { runClaude, type Effort } from '../utils/claude-cli';
 import { verifyQuine } from '../utils/quine';
-import { WORKSPACE_DIR, commitQuine } from '../utils/state';
+import { PROJECT_ROOT, WORKSPACE_DIR, commitQuine } from '../utils/state';
 import { shutdownRequested, shutdownSignal } from '../utils/shutdown';
 import { SYSTEM_PROMPT, bootstrapPrompt, growPrompt, feedbackPrompt, freshRetryPrompt } from '../prompts';
 
@@ -22,6 +22,37 @@ const SESSION_TIMEOUT_MS = intEnv('QUINER_SESSION_TIMEOUT_MS', 15 * 60 * 1000);
 const STREAM = process.env.QUINER_STREAM !== '0';
 
 const CANDIDATE = join(WORKSPACE_DIR, 'candidate.js');
+const MCP_CONFIG = join(WORKSPACE_DIR, '.quiner-mcp.json');
+
+/**
+ * Per-iteration MCP config giving the claude session the `verify_candidate`
+ * tool — the same verifier the harness runs, with the current best length
+ * baked in — so the agent tests attempts through an explicit tool instead of
+ * inventing its own checks.
+ */
+function writeMcpConfig(bestLength: number): string {
+  writeFileSync(
+    MCP_CONFIG,
+    JSON.stringify(
+      {
+        mcpServers: {
+          quiner: {
+            command: join(PROJECT_ROOT, 'node_modules', '.bin', 'tsx'),
+            args: [join(PROJECT_ROOT, 'src', 'mastra', 'tools', 'verify-server.ts')],
+            env: {
+              PATH: process.env.PATH ?? '',
+              QUINER_WORKSPACE: WORKSPACE_DIR,
+              QUINER_BEST_LENGTH: String(bestLength),
+            },
+          },
+        },
+      },
+      null,
+      2,
+    ) + '\n',
+  );
+  return MCP_CONFIG;
+}
 
 const generateAndVerify = createStep({
   id: 'generate-and-verify',
@@ -41,6 +72,8 @@ const generateAndVerify = createStep({
 
     // A stale candidate from a previous iteration must never count.
     rmSync(CANDIDATE, { force: true });
+
+    const mcpConfigPath = writeMcpConfig(bestLength);
 
     // Read the reference source here rather than receiving it as workflow
     // input, so quine bytes never sit in run snapshots or grow the db.
@@ -74,8 +107,10 @@ const generateAndVerify = createStep({
         resumeSessionId: sessionId,
         appendSystemPrompt: SYSTEM_PROMPT,
         timeoutMs: SESSION_TIMEOUT_MS,
+        mcpConfigPath,
         signal: shutdownSignal(),
         onText: STREAM ? (t) => process.stdout.write(t) : undefined,
+        onToolUse: (name) => console.log(`[quiner]   tool: ${name}`),
       });
       if (STREAM) process.stdout.write('\n');
       // Keep the session for feedback turns while it's alive; if a transport
