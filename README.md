@@ -13,10 +13,13 @@ Each loop iteration runs a two-step Mastra workflow:
    current best and demand a *strictly longer* one. The agent writes `workspace/candidate.js`
    and can self-test with `node candidate.js | diff - candidate.js`. The harness then verifies
    independently: bans read-your-own-source tokens (`require`, `import`, `__filename`, `argv`,
-   `fs`, …), copies the candidate under a random filename into an empty temp dir, runs it as
-   CommonJS with a minimal env and a 10s timeout, and byte-compares stdout to the source.
-   Failures resume the same claude session with a precise diff report (up to
-   `QUINER_MAX_ATTEMPTS` tries).
+   `fs`, `getBuiltinModule`, …) for fast feedback, then pipes the source to `node -` over
+   stdin (CommonJS) from an empty temp dir with a minimal env and a 10s/64MB limit, and
+   byte-compares stdout to the source. Piping over stdin is the real defense: the source never
+   exists on disk during verification, so no self-read trick can work regardless of
+   obfuscation. Failures resume the same claude session with a precise diff report (up to
+   `QUINER_MAX_ATTEMPTS` tries; if the session died without an id, the retry restates the full
+   task in a fresh session).
 2. **commit-quine** — re-verifies the exact bytes, writes
    `completed/quine-<seq>-<bytes>b.js`, updates `state.json`, and commits both to git.
 
@@ -27,7 +30,12 @@ Then the loop goes again, forever.
 All durable state is `completed/` + git history; `state.json` is just a cache. Every loop
 turn re-scans `completed/` from scratch, so you can kill the process (Ctrl-C) at any moment
 and `npm start` resumes exactly where it left off — at most the in-flight iteration is lost.
-First Ctrl-C aborts the in-flight claude session and stops cleanly; second one force-exits.
+First Ctrl-C aborts the in-flight claude session (killing its whole process group) and stops
+cleanly; a second one reaps any children and force-exits. Crash-safety details: quine files
+are written atomically (tmp + rename) and `commitQuine` stages `completed/` with `-A`, so a
+quine orphaned by a crash mid-commit is swept into the next commit; commits run with
+`--no-verify --no-gpg-sign` so global hooks/gpg config can't wedge the loop; a `.quiner.pid`
+lock refuses to start a second concurrent loop.
 
 ## Run
 

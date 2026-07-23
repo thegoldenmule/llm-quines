@@ -1,6 +1,9 @@
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { mastra } from './mastra/index';
-import { ensureDirs, ensureGitRepo, scanState, readBestSource } from './mastra/utils/state';
-import { requestShutdown, shutdownRequested } from './mastra/utils/shutdown';
+import { PROJECT_ROOT, ensureDirs, ensureGitRepo, scanState } from './mastra/utils/state';
+import { requestShutdown, shutdownRequested, shutdownSignal } from './mastra/utils/shutdown';
+import { killAllClaudeProcesses } from './mastra/utils/claude-cli';
 
 /**
  * The quiner loop: forever, run one quine-workflow iteration (generate a
@@ -20,8 +23,57 @@ function intEnv(name: string, fallback: number): number {
 
 const DELAY_MS = intEnv('QUINER_DELAY_MS', 2_000);
 const MAX_ITERATIONS = intEnv('QUINER_MAX_ITERATIONS', 0) || Infinity;
+const LOCK_FILE = join(PROJECT_ROOT, '.quiner.pid');
 
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+/** Sleep that wakes immediately when shutdown is requested. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(done, ms);
+    function done() {
+      clearTimeout(timer);
+      shutdownSignal().removeEventListener('abort', done);
+      resolve();
+    }
+    shutdownSignal().addEventListener('abort', done, { once: true });
+  });
+}
+
+/** Mastra's failed-run error is a plain {message,...} object at runtime, not an Error. */
+function errorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (e && typeof e === 'object' && 'message' in e) return String((e as { message: unknown }).message);
+  return String(e);
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/** Refuse to run two loops at once — they'd race on workspace/, seq numbers, and git. */
+function acquireLock(): void {
+  try {
+    writeFileSync(LOCK_FILE, `${process.pid}\n`, { flag: 'wx' });
+  } catch {
+    const prev = parseInt(readFileSync(LOCK_FILE, 'utf-8'), 10);
+    if (Number.isFinite(prev) && prev !== process.pid && pidAlive(prev)) {
+      console.error(`[quiner] another quiner loop (pid ${prev}) is already running — exiting`);
+      process.exit(1);
+    }
+    writeFileSync(LOCK_FILE, `${process.pid}\n`);
+  }
+  process.on('exit', () => {
+    try {
+      if (parseInt(readFileSync(LOCK_FILE, 'utf-8'), 10) === process.pid) rmSync(LOCK_FILE);
+    } catch {
+      // lock already gone
+    }
+  });
+}
 
 let signals = 0;
 function onSignal(sig: string) {
@@ -30,7 +82,8 @@ function onSignal(sig: string) {
     console.log(`\n[quiner] ${sig} received — aborting in-flight session and stopping (state is safe; restart with npm start)`);
     requestShutdown();
   } else {
-    console.log(`\n[quiner] ${sig} received again — exiting immediately`);
+    console.log(`\n[quiner] ${sig} received again — killing children and exiting immediately`);
+    killAllClaudeProcesses();
     process.exit(130);
   }
 }
@@ -40,6 +93,7 @@ process.on('SIGTERM', () => onSignal('SIGTERM'));
 async function main(): Promise<void> {
   ensureDirs();
   ensureGitRepo();
+  acquireLock();
 
   let iterations = 0;
   let consecutiveFailures = 0;
@@ -58,7 +112,6 @@ async function main(): Promise<void> {
           seq: state.nextSeq,
           bestLength: state.bestLength,
           bestFile: state.bestFile,
-          bestSource: readBestSource(state),
         },
       });
 
@@ -68,11 +121,11 @@ async function main(): Promise<void> {
       } else {
         consecutiveFailures++;
         const error = result.status === 'failed' ? result.error : `workflow ended with status ${result.status}`;
-        console.log(`[quiner] ✗ iteration failed: ${error instanceof Error ? error.message : String(error)}`);
+        console.log(`[quiner] ✗ iteration failed: ${errorMessage(error)}`);
       }
     } catch (err) {
       consecutiveFailures++;
-      console.log(`[quiner] ✗ iteration threw: ${err instanceof Error ? err.message : String(err)}`);
+      console.log(`[quiner] ✗ iteration threw: ${errorMessage(err)}`);
     }
 
     iterations++;

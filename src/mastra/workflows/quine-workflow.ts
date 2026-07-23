@@ -6,7 +6,7 @@ import { runClaude, type Effort } from '../utils/claude-cli';
 import { verifyQuine } from '../utils/quine';
 import { WORKSPACE_DIR, commitQuine } from '../utils/state';
 import { shutdownRequested, shutdownSignal } from '../utils/shutdown';
-import { SYSTEM_PROMPT, bootstrapPrompt, growPrompt, feedbackPrompt } from '../prompts';
+import { SYSTEM_PROMPT, bootstrapPrompt, growPrompt, feedbackPrompt, freshRetryPrompt } from '../prompts';
 
 function intEnv(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -30,7 +30,6 @@ const generateAndVerify = createStep({
     seq: z.number(),
     bestLength: z.number(),
     bestFile: z.string().optional(),
-    bestSource: z.string().optional(),
   }),
   outputSchema: z.object({
     seq: z.number(),
@@ -38,11 +37,15 @@ const generateAndVerify = createStep({
     sourceB64: z.string(),
   }),
   execute: async ({ inputData }) => {
-    const { seq, bestLength, bestFile, bestSource } = inputData;
+    const { seq, bestLength, bestFile } = inputData;
 
     // A stale candidate from a previous iteration must never count.
     rmSync(CANDIDATE, { force: true });
 
+    // Read the reference source here rather than receiving it as workflow
+    // input, so quine bytes never sit in run snapshots or grow the db.
+    const bestSource =
+      bestFile && existsSync(bestFile) ? readFileSync(bestFile, 'utf-8') : undefined;
     const firstPrompt =
       bestFile === undefined || bestLength === 0
         ? bootstrapPrompt()
@@ -54,7 +57,15 @@ const generateAndVerify = createStep({
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       if (shutdownRequested()) throw new Error('shutdown requested');
 
-      const prompt = attempt === 0 ? firstPrompt : feedbackPrompt(lastFailure, bestLength);
+      // Resumed retries get terse feedback; a fresh session (first attempt,
+      // or the previous session died without a session id) needs the full
+      // task restated.
+      const prompt =
+        attempt === 0
+          ? firstPrompt
+          : sessionId
+            ? feedbackPrompt(lastFailure, bestLength)
+            : freshRetryPrompt(firstPrompt, lastFailure);
       console.log(`\n[quiner] seq=${seq} attempt ${attempt + 1}/${MAX_ATTEMPTS}${sessionId ? ' (resuming session)' : ''}`);
 
       const res = await runClaude(prompt, WORKSPACE_DIR, {
@@ -67,7 +78,10 @@ const generateAndVerify = createStep({
         onText: STREAM ? (t) => process.stdout.write(t) : undefined,
       });
       if (STREAM) process.stdout.write('\n');
-      sessionId = res.sessionId ?? sessionId;
+      // Keep the session for feedback turns while it's alive; if a transport
+      // failure yielded no id (dead/stale session), drop ours so the next
+      // attempt starts fresh instead of resuming a broken id forever.
+      sessionId = res.sessionId ?? (res.success ? sessionId : undefined);
 
       if (shutdownRequested()) throw new Error('shutdown requested');
 
@@ -140,13 +154,17 @@ export const quineWorkflow = createWorkflow({
     seq: z.number(),
     bestLength: z.number(),
     bestFile: z.string().optional(),
-    bestSource: z.string().optional(),
   }),
   outputSchema: z.object({
     seq: z.number(),
     file: z.string(),
     byteLength: z.number(),
   }),
+  options: {
+    // Durable state lives in completed/ + git; snapshots would grow mastra.db
+    // by O(quine size) every iteration, forever.
+    shouldPersistSnapshot: () => false,
+  },
 })
   .then(generateAndVerify)
   .then(commitStep)

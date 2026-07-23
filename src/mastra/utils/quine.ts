@@ -1,18 +1,19 @@
 import { spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { randomBytes } from 'node:crypto';
 
 /**
  * Independent quine verification. A candidate passes when:
  *  1. It contains none of the banned "read your own source" escape hatches.
- *  2. `node <file>` — run under a random filename, in an empty temp dir, with
- *     a minimal env — writes the file's exact bytes to stdout and exits 0.
+ *  2. Its source, piped to `node -` over STDIN (CommonJS) from an empty temp
+ *     dir with a minimal env, is written byte-for-byte to stdout with exit 0.
  *
- * The token blacklist is a guardrail against lazy cheating (reading the file
- * from disk), not a security boundary; the generator prompt lists the same
- * tokens so failures come with an explanation the model can act on.
+ * Running from stdin is the load-bearing defense: during verification the
+ * source never exists on disk, so no self-reading technique — however
+ * obfuscated — has anything to read. The token blacklist exists on top of
+ * that to give the model fast, explainable feedback (and the generator
+ * prompt lists the same tokens, so every rejection is actionable).
  */
 
 export interface VerifyResult {
@@ -30,6 +31,7 @@ const BANNED: Array<{ re: RegExp; label: string }> = [
   { re: /\bargv\b/, label: 'process.argv' },
   { re: /\bmainModule\b/, label: 'process.mainModule' },
   { re: /\bbinding\b/, label: 'process.binding' },
+  { re: /\bgetBuiltinModule\b/, label: 'process.getBuiltinModule' },
   { re: /\bmodule\b/, label: 'module' },
   { re: /\bchild_process\b/, label: 'child_process' },
   { re: /\breadFile\w*\b/, label: 'readFile*' },
@@ -40,7 +42,7 @@ const BANNED: Array<{ re: RegExp; label: string }> = [
 ];
 
 const RUN_TIMEOUT_MS = 10_000;
-const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
+const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 
 export function checkBannedTokens(source: string): string | null {
   for (const { re, label } of BANNED) {
@@ -83,21 +85,34 @@ export async function verifyQuine(source: Buffer): Promise<VerifyResult> {
     // The empty program technically prints itself, but it's not a quine we accept.
     return { ok: false, reason: 'candidate is empty', byteLength };
   }
+  if (byteLength > MAX_OUTPUT_BYTES) {
+    return {
+      ok: false,
+      reason: `candidate is ${byteLength} bytes, over the ${MAX_OUTPUT_BYTES / (1024 * 1024)} MB verification limit`,
+      byteLength,
+    };
+  }
 
   const banned = checkBannedTokens(source.toString('utf-8'));
   if (banned) return { ok: false, reason: banned, byteLength };
 
-  // Run a copy under a random name in an empty temp dir so the program cannot
-  // find its source at any path it could have memorized. The temp dir pins
-  // CommonJS to match the workspace the agent self-tests in.
+  // Empty temp dir as cwd; the source itself is piped over stdin and never
+  // touches disk, so it cannot be read back by the program under test.
   const dir = mkdtempSync(join(tmpdir(), 'quiner-verify-'));
-  const file = join(dir, `q${randomBytes(6).toString('hex')}.js`);
   try {
+    // Pin CommonJS for any relative resolution, matching the workspace the
+    // agent self-tests in (stdin input is CommonJS by default anyway).
     writeFileSync(join(dir, 'package.json'), '{ "type": "commonjs" }\n');
-    writeFileSync(file, source);
-    const run = await runNode(file, dir);
+    const run = await runNodeStdin(source, dir);
     if (run.timedOut) {
       return { ok: false, reason: `program did not finish within ${RUN_TIMEOUT_MS}ms`, byteLength };
+    }
+    if (run.tooLarge) {
+      return {
+        ok: false,
+        reason: `program printed more than the ${MAX_OUTPUT_BYTES / (1024 * 1024)} MB output limit`,
+        byteLength,
+      };
     }
     if (run.exitCode !== 0) {
       return {
@@ -119,31 +134,37 @@ export async function verifyQuine(source: Buffer): Promise<VerifyResult> {
   }
 }
 
-function runNode(
-  file: string,
+function runNodeStdin(
+  source: Buffer,
   cwd: string,
-): Promise<{ exitCode: number; stdout: Buffer; stderr: string; timedOut: boolean }> {
+): Promise<{ exitCode: number; stdout: Buffer; stderr: string; timedOut: boolean; tooLarge: boolean }> {
   return new Promise((resolve) => {
-    const proc = spawn(process.execPath, ['--no-warnings', file], {
+    const proc = spawn(process.execPath, ['--no-warnings', '-'], {
       cwd,
       env: { PATH: process.env.PATH ?? '' },
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
     });
 
     const stdoutChunks: Buffer[] = [];
     let stdoutBytes = 0;
     let stderr = '';
     let timedOut = false;
+    let tooLarge = false;
 
     const timer = setTimeout(() => {
       timedOut = true;
       proc.kill('SIGKILL');
     }, RUN_TIMEOUT_MS);
 
+    proc.stdin.on('error', () => {
+      // Program may exit without reading stdin; EPIPE here is fine.
+    });
+    proc.stdin.end(source);
+
     proc.stdout.on('data', (d: Buffer) => {
       stdoutBytes += d.length;
       if (stdoutBytes > MAX_OUTPUT_BYTES) {
-        timedOut = false;
+        tooLarge = true;
         proc.kill('SIGKILL');
         return;
       }
@@ -155,11 +176,11 @@ function runNode(
 
     proc.on('error', () => {
       clearTimeout(timer);
-      resolve({ exitCode: 1, stdout: Buffer.concat(stdoutChunks), stderr: 'failed to spawn node', timedOut });
+      resolve({ exitCode: 1, stdout: Buffer.concat(stdoutChunks), stderr: 'failed to spawn node', timedOut, tooLarge });
     });
     proc.on('close', (code) => {
       clearTimeout(timer);
-      resolve({ exitCode: code ?? 1, stdout: Buffer.concat(stdoutChunks), stderr: stderr.trim(), timedOut });
+      resolve({ exitCode: code ?? 1, stdout: Buffer.concat(stdoutChunks), stderr: stderr.trim(), timedOut, tooLarge });
     });
   });
 }

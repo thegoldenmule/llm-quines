@@ -39,6 +39,25 @@ const cases: Case[] = [
     expectReasonIncludes: 'banned token',
   },
   {
+    name: 'getBuiltinModule cheat (banned token)',
+    source: 'const q = process.getBuiltinModule("f" + "s");\n',
+    expectOk: false,
+    expectReasonIncludes: 'banned token',
+  },
+  {
+    // The review-proven bypass: no banned token matches, recovers its own
+    // path from Error().stack and reads itself. Under stdin verification the
+    // stack has no on-disk path, so this must die at runtime.
+    name: 'obfuscated self-read cheat (stdin defense)',
+    source:
+      'const g = process["get" + "Builtin" + "Mod" + "ule"];\n' +
+      'const f = g("f" + "s");\n' +
+      'const p = new Error().stack.match(/\\((\\/[^)]+):\\d+:\\d+\\)/);\n' +
+      'process.stdout.write(f["read" + "F" + "ile" + "Sync"](p[1], "utf8"));\n',
+    expectOk: false,
+    expectReasonIncludes: 'exited with code',
+  },
+  {
     name: 'not a quine',
     source: 'console.log("hello")\n',
     expectOk: false,

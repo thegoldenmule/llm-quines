@@ -1,4 +1,4 @@
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 
 /**
  * Minimal wrapper around the Claude Code CLI in print mode (`claude -p`),
@@ -22,7 +22,7 @@ export interface RunClaudeOptions {
   timeoutMs?: number;
   /** Streaming text callback (assistant text deltas), for live logging. */
   onText?: (text: string) => void;
-  /** Abort signal — kills the child process when fired. */
+  /** Abort signal — kills the child process tree when fired. */
   signal?: AbortSignal;
 }
 
@@ -46,6 +46,28 @@ function resolveClaudeBin(): string {
 }
 
 const CLAUDE_BIN = resolveClaudeBin();
+
+/** Live child processes, so a hard shutdown can reap the whole tree. */
+const liveProcs = new Set<ChildProcess>();
+
+/** Kill a detached child's entire process group (falls back to the child). */
+function killTree(proc: ChildProcess, sig: NodeJS.Signals): void {
+  if (proc.pid == null) return;
+  try {
+    process.kill(-proc.pid, sig);
+  } catch {
+    try {
+      proc.kill(sig);
+    } catch {
+      // already gone
+    }
+  }
+}
+
+/** SIGKILL every live claude process group. Used on forced shutdown. */
+export function killAllClaudeProcesses(): void {
+  for (const proc of liveProcs) killTree(proc, 'SIGKILL');
+}
 
 export function buildArgs(prompt: string, opts: RunClaudeOptions): string[] {
   const args: string[] = [
@@ -78,43 +100,80 @@ export function runClaude(
   }
 
   return new Promise((resolve) => {
+    // detached: own process group, so timeout/abort can kill claude AND any
+    // subprocesses its agent spawned, not just the direct child.
     const proc = spawn(CLAUDE_BIN, buildArgs(prompt, opts), {
       cwd,
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true,
     });
+    liveProcs.add(proc);
 
     let lineBuffer = '';
     let stderr = '';
     let timedOut = false;
     let settled = false;
+    let exitFallbackTimer: NodeJS.Timeout | undefined;
     let resultEvent: {
       subtype?: string;
       result?: string;
       session_id?: string;
       is_error?: boolean;
+      errors?: string[];
     } | null = null;
+    let initSessionId: string | undefined;
     let lastAssistantText = '';
 
     const killTimer = setTimeout(() => {
       timedOut = true;
-      proc.kill('SIGTERM');
-      setTimeout(() => proc.kill('SIGKILL'), 5_000).unref();
+      killTree(proc, 'SIGTERM');
+      setTimeout(() => killTree(proc, 'SIGKILL'), 5_000).unref();
     }, timeoutMs);
     killTimer.unref();
 
     const onAbort = () => {
-      proc.kill('SIGTERM');
-      setTimeout(() => proc.kill('SIGKILL'), 5_000).unref();
+      killTree(proc, 'SIGTERM');
+      setTimeout(() => killTree(proc, 'SIGKILL'), 5_000).unref();
     };
     opts.signal?.addEventListener('abort', onAbort, { once: true });
 
-    const settle = (r: RunClaudeResult) => {
+    const settle = (exitCode: number) => {
       if (settled) return;
       settled = true;
       clearTimeout(killTimer);
+      if (exitFallbackTimer) clearTimeout(exitFallbackTimer);
       opts.signal?.removeEventListener('abort', onAbort);
-      resolve(r);
+      liveProcs.delete(proc);
+
+      if (resultEvent) {
+        const success = !resultEvent.is_error && resultEvent.subtype === 'success' && exitCode === 0;
+        // `||` on purpose: error-subtype result events carry result: "" with
+        // the real message in errors[] (mirrors the reference buildResult).
+        const text =
+          resultEvent.result ||
+          lastAssistantText ||
+          (resultEvent.errors?.length ? resultEvent.errors.join('; ') : '') ||
+          stderr.trim();
+        resolve({
+          success,
+          result: text,
+          sessionId: resultEvent.session_id ?? initSessionId,
+          exitCode,
+          timedOut,
+        });
+      } else {
+        resolve({
+          success: false,
+          result:
+            lastAssistantText ||
+            stderr.trim() ||
+            (timedOut ? `session timed out after ${timeoutMs}ms` : `claude exited with code ${exitCode} and no result event`),
+          sessionId: initSessionId,
+          exitCode,
+          timedOut,
+        });
+      }
     };
 
     proc.stdout.on('data', (data: Buffer) => {
@@ -131,6 +190,10 @@ export function runClaude(
         }
         if (parsed.type === 'result') {
           resultEvent = parsed;
+        } else if (parsed.type === 'system' && parsed.subtype === 'init') {
+          // Captured so a session that dies before its result event (e.g.
+          // timeout) is still resumable on the next attempt.
+          if (typeof parsed.session_id === 'string') initSessionId = parsed.session_id;
         } else if (parsed.type === 'stream_event') {
           const delta = parsed.event?.delta;
           if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
@@ -152,36 +215,18 @@ export function runClaude(
     });
 
     proc.on('error', (err) => {
-      settle({
-        success: false,
-        result: `failed to spawn ${CLAUDE_BIN}: ${err.message}`,
-        exitCode: 1,
-        timedOut,
-      });
+      resultEvent = null;
+      stderr = stderr || `failed to spawn ${CLAUDE_BIN}: ${err.message}`;
+      settle(1);
     });
 
-    proc.on('close', (code) => {
-      const exitCode = code ?? 1;
-      if (resultEvent) {
-        const success = !resultEvent.is_error && resultEvent.subtype === 'success' && exitCode === 0;
-        settle({
-          success,
-          result: resultEvent.result ?? lastAssistantText,
-          sessionId: resultEvent.session_id,
-          exitCode,
-          timedOut,
-        });
-      } else {
-        settle({
-          success: false,
-          result:
-            lastAssistantText ||
-            stderr.trim() ||
-            (timedOut ? `session timed out after ${timeoutMs}ms` : `claude exited with code ${exitCode} and no result event`),
-          exitCode,
-          timedOut,
-        });
-      }
+    // Normal path: 'close' fires once the process exits and its stdio drains.
+    proc.on('close', (code) => settle(code ?? 1));
+
+    // Fallback: if a surviving grandchild holds the stdout pipe open, 'close'
+    // never fires — settle shortly after 'exit' with whatever we parsed.
+    proc.on('exit', (code) => {
+      exitFallbackTimer = setTimeout(() => settle(code ?? 1), 1_500);
     });
   });
 }

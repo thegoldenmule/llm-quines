@@ -4,5 +4,7 @@ workspace/
 dist/
 *.db
 *.db-*
+*.tmp
+.quiner.pid
 logs/
 .env
