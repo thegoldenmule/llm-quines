@@ -2,8 +2,7 @@
 
 An agent loop that builds ever-larger, ever-more-computational JavaScript quines. Built on
 [Mastra](https://mastra.ai) workflows, with all LLM calls going through the local **Claude
-Code CLI in print mode** (`claude -p`, same pattern as mastra-hotseat's executor) — no direct
-Anthropic API calls.
+Code CLI in print mode** (`claude -p`) — no direct Anthropic API calls.
 
 Fitness is two-dimensional: each accepted quine must strictly beat the incumbent in **bytes
 AND executed steps** (deterministic V8 block-execution counts via `NODE_V8_COVERAGE`), with
@@ -76,7 +75,7 @@ npm run dev          # mastra dev playground (optional)
 
 Requires the `claude` CLI installed and authenticated. The spawned sessions strip
 `ANTHROPIC_API_KEY` (subscription billing) and `CLAUDECODE` (allows launching from inside a
-Claude Code session), mirroring mastra-hotseat.
+Claude Code session).
 
 ## Configuration (env)
 
