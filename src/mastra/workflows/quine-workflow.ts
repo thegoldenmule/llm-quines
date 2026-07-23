@@ -3,7 +3,8 @@ import { z } from 'zod';
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { runClaude, type Effort } from '../utils/claude-cli';
-import { evaluateCandidate } from '../utils/quine';
+import { evaluateCandidate, literalFraction } from '../utils/quine';
+import { judgeCandidate } from '../llm/judge';
 import { PROJECT_ROOT, WORKSPACE_DIR, commitQuine } from '../utils/state';
 import { shutdownRequested, shutdownSignal } from '../utils/shutdown';
 import { SYSTEM_PROMPT, bootstrapPrompt, growPrompt, feedbackPrompt, freshRetryPrompt } from '../prompts';
@@ -20,6 +21,7 @@ const MODEL = process.env.QUINER_MODEL || undefined;
 const MAX_ATTEMPTS = intEnv('QUINER_MAX_ATTEMPTS', 3);
 const SESSION_TIMEOUT_MS = intEnv('QUINER_SESSION_TIMEOUT_MS', 15 * 60 * 1000);
 const STREAM = process.env.QUINER_STREAM !== '0';
+const JUDGE_ENABLED = process.env.QUINER_JUDGE !== '0';
 
 const CANDIDATE = join(WORKSPACE_DIR, 'candidate.js');
 const MCP_CONFIG = join(WORKSPACE_DIR, '.quiner-mcp.json');
@@ -69,6 +71,7 @@ const generateAndVerify = createStep({
     bestBytes: z.number(),
     bestSteps: z.number(),
     sourceB64: z.string(),
+    judgeNote: z.string(),
   }),
   execute: async ({ inputData }) => {
     const { seq, bestBytes, bestSteps, bestFile } = inputData;
@@ -149,7 +152,51 @@ const generateAndVerify = createStep({
       console.log(
         `[quiner] verified quine: ${m.bytes} bytes, ${m.steps} steps (${m.stepsPerByte.toFixed(1)}/byte), ${(m.literalFraction * 100).toFixed(1)}% literal`,
       );
-      return { seq, bestBytes, bestSteps, sourceB64: source.toString('base64') };
+
+      // Semantic layer: the deterministic gate passed — now the LLM judge
+      // decides whether the candidate is genuinely MORE INTERESTING than the
+      // incumbent. Rejections become feedback for the next attempt. Judge
+      // unavailability fails OPEN (with a loud note) so an outage cannot
+      // wedge the loop.
+      let judgeNote = '';
+      if (JUDGE_ENABLED && bestSource !== undefined) {
+        console.log('[quiner] running interestingness judge...');
+        let incumbentLiteral = 0;
+        try {
+          incumbentLiteral = literalFraction(bestSource);
+        } catch {
+          // Legacy incumbent that no longer parses cleanly — fraction stays 0.
+        }
+        const judged = await judgeCandidate(
+          { source: source.toString('utf-8'), metrics: m },
+          {
+            source: bestSource,
+            metrics: {
+              bytes: bestBytes,
+              steps: bestSteps,
+              stepsPerByte: bestBytes > 0 ? bestSteps / bestBytes : 0,
+              literalFraction: incumbentLiteral,
+            },
+          },
+        );
+        if (shutdownRequested()) throw new Error('shutdown requested');
+        if (judged.ok && !judged.verdict.interesting) {
+          const v = judged.verdict;
+          lastFailure = `the deterministic gate PASSED, but the interestingness judge REJECTED your program (score ${v.score}/10): ${v.critique || v.reasoning}`;
+          console.log(`[quiner] judge rejected (score ${v.score}/10): ${(v.reasoning || v.critique).split('\n')[0].slice(0, 160)}`);
+          continue;
+        }
+        if (judged.ok) {
+          const v = judged.verdict;
+          judgeNote = `judge: ${v.score}/10 — ${v.reasoning}`.slice(0, 400);
+          console.log(`[quiner] judge accepted (score ${v.score}/10): ${v.reasoning.split('\n')[0].slice(0, 160)}`);
+        } else {
+          judgeNote = 'judge unavailable — accepted on deterministic gate only';
+          console.warn(`[quiner] WARNING: ${judged.failure} — failing open`);
+        }
+      }
+
+      return { seq, bestBytes, bestSteps, sourceB64: source.toString('base64'), judgeNote };
     }
 
     throw new Error(`no verified quine after ${MAX_ATTEMPTS} attempts (last failure: ${lastFailure.split('\n')[0]})`);
@@ -164,6 +211,7 @@ const commitStep = createStep({
     bestBytes: z.number(),
     bestSteps: z.number(),
     sourceB64: z.string(),
+    judgeNote: z.string(),
   }),
   outputSchema: z.object({
     seq: z.number(),
@@ -173,13 +221,15 @@ const commitStep = createStep({
   }),
   execute: async ({ inputData }) => {
     const source = Buffer.from(inputData.sourceB64, 'base64');
-    // Defense in depth: the bytes we commit are the bytes we verified.
+    // Defense in depth: the bytes we commit are the bytes we verified. Only
+    // the deterministic gate re-runs here — re-running the judge would make
+    // commits flaky on an inherently nondeterministic check.
     const verdict = await evaluateCandidate(source, {
       bestBytes: inputData.bestBytes,
       bestSteps: inputData.bestSteps,
     });
     if (!verdict.ok) throw new Error(`quine failed re-verification at commit time: ${verdict.reason}`);
-    const { file, byteLength } = commitQuine(source, inputData.seq, verdict.metrics.steps);
+    const { file, byteLength } = commitQuine(source, inputData.seq, verdict.metrics.steps, inputData.judgeNote);
     console.log(`[quiner] committed ${file} (${byteLength} bytes, ${verdict.metrics.steps} steps)`);
     return { seq: inputData.seq, file, byteLength, steps: verdict.metrics.steps };
   },

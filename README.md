@@ -13,6 +13,18 @@ computation. Candidates must be deterministic (`random`/`Date`/`hrtime`/`perform
 banned along with the self-reading tokens). True asymptotic complexity is undecidable; these
 are the deterministic proxies.
 
+On top of the deterministic gate sits a semantic layer: an **LLM interestingness judge**
+(also via `claude -p`, tools disallowed, strict-JSON verdict) compares each candidate that
+clears the gate against the incumbent and rejects it unless it is *genuinely more
+interesting as a quine* — computation must be load-bearing for self-reproduction, accretion
+("incumbent + one more bolted-on section") is an automatic NO, and self-reference depth
+(programs that analyze/derive/validate their own text at runtime) scores highest. The full
+criteria live in `JUDGE_CRITERIA` in `src/mastra/prompts.ts` and are shown verbatim to both
+the generator and the judge. Rejections feed back into the generator session as critique;
+the verdict (score + reasoning) is recorded in the quine's git commit message. If the judge
+is unavailable (transport failure), acceptance fails open on the deterministic gate with a
+note, so an outage can't wedge the loop.
+
 ## How it works
 
 Each loop iteration runs a two-step Mastra workflow:
@@ -77,6 +89,10 @@ Claude Code session), mirroring mastra-hotseat.
 | `QUINER_DELAY_MS` | `2000` | pause between iterations |
 | `QUINER_MAX_ITERATIONS` | ∞ | stop after N iterations (smoke tests) |
 | `QUINER_STREAM` | on | set `0` to silence live token streaming |
+| `QUINER_JUDGE` | on | set `0` to disable the LLM interestingness judge |
+| `QUINER_JUDGE_EFFORT` | `medium` | `--effort` for judge sessions |
+| `QUINER_JUDGE_MODEL` | CLI default | `--model` for judge sessions |
+| `QUINER_JUDGE_TIMEOUT_MS` | `300000` | wall-clock kill for one judge session |
 
 ## Notes
 

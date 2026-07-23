@@ -32,7 +32,8 @@ server.registerTool(
       `the source is piped to \`node -\` over stdin (CommonJS, empty temp dir, minimal env, 10s/64MB limits) and stdout must equal the source byte-for-byte; ` +
       `then executed steps are measured deterministically via V8 block-execution counts. ` +
       `The candidate must STRICTLY EXCEED the current best on BOTH axes: > ${BEST_BYTES} bytes AND > ${BEST_STEPS} steps. ` +
-      `Returns PASS or a precise failure report plus the measured metrics. Call it after every edit of candidate.js; only stop when it returns PASS.`,
+      `Returns PASS or a precise failure report plus the measured metrics. Call it after every edit of candidate.js; only stop when it returns PASS. ` +
+      `Note: this tool covers the deterministic gate; after your turn an LLM judge additionally compares your program against the incumbent for INTERESTINGNESS (see the criteria in your task prompt) — design for that bar from the start.`,
     inputSchema: {},
   },
   async () => {

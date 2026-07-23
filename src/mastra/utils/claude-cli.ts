@@ -26,6 +26,8 @@ export interface RunClaudeOptions {
   onToolUse?: (name: string) => void;
   /** Path to an MCP config JSON; loaded with --strict-mcp-config. */
   mcpConfigPath?: string;
+  allowedTools?: string[];
+  disallowedTools?: string[];
   /** Abort signal — kills the child process tree when fired. */
   signal?: AbortSignal;
 }
@@ -83,6 +85,8 @@ export function buildArgs(prompt: string, opts: RunClaudeOptions): string[] {
   if (opts.effort) args.push('--effort', opts.effort);
   if (opts.model) args.push('--model', opts.model);
   if (opts.appendSystemPrompt) args.push('--append-system-prompt', opts.appendSystemPrompt);
+  if (opts.allowedTools && opts.allowedTools.length > 0) args.push('--allowed-tools', opts.allowedTools.join(','));
+  if (opts.disallowedTools && opts.disallowedTools.length > 0) args.push('--disallowed-tools', opts.disallowedTools.join(','));
   if (opts.mcpConfigPath) args.push('--mcp-config', opts.mcpConfigPath, '--strict-mcp-config');
   if (opts.resumeSessionId) args.push('--resume', opts.resumeSessionId);
   args.push('-p', prompt);

@@ -172,6 +172,7 @@ export function commitQuine(
   source: Buffer,
   seq: number,
   steps: number,
+  note?: string,
 ): { file: string; byteLength: number } {
   ensureDirs();
   const byteLength = source.length;
@@ -184,6 +185,10 @@ export function commitQuine(
   git(['add', '-A', '--', COMPLETED_DIR, STATE_FILE]);
   // --no-verify/--no-gpg-sign: a global hook or gpg config must not be able
   // to wedge the loop.
-  git(['commit', '--no-verify', '--no-gpg-sign', '-m', `quine #${seq}: ${byteLength} bytes, ${steps} steps`]);
+  git([
+    'commit', '--no-verify', '--no-gpg-sign',
+    '-m', `quine #${seq}: ${byteLength} bytes, ${steps} steps`,
+    ...(note ? ['-m', note] : []),
+  ]);
   return { file: path, byteLength };
 }

@@ -1,4 +1,5 @@
 import { evaluateCandidate, literalFraction, measureSteps, verifyQuine } from './mastra/utils/quine';
+import { extractJson } from './mastra/llm/judge';
 
 /**
  * Sanity tests for the quine verifier and metrics: known-good quines must
@@ -168,6 +169,22 @@ for (const c of cases) {
   const literalHeavy = `const s = \`${'x'.repeat(200)}\`;\nconsole.log(s.length);\n`;
   const capped = await evaluateCandidate(Buffer.from(literalHeavy), { bestBytes: 0, bestSteps: 0 });
   check('evaluateCandidate enforces literal cap', !capped.ok && capped.reason.includes('literal'), capped.reason.slice(0, 200));
+}
+
+{
+  const clean = extractJson('{"interesting": true, "score": 7}') as Record<string, unknown>;
+  check('extractJson clean object', clean.interesting === true && clean.score === 7);
+
+  const wrapped = extractJson('Here is my verdict:\n```json\n{"interesting": false, "score": 2, "reasoning": "same {skeleton}"}\n```\nDone.') as Record<string, unknown>;
+  check('extractJson tolerates prose and fences', wrapped.interesting === false && wrapped.reasoning === 'same {skeleton}');
+
+  let threw = false;
+  try {
+    extractJson('no json here at all');
+  } catch {
+    threw = true;
+  }
+  check('extractJson throws on no object', threw);
 }
 
 if (failures > 0) {
