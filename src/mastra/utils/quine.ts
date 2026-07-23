@@ -1,26 +1,58 @@
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { randomBytes } from 'node:crypto';
+import * as acorn from 'acorn';
+import { simple as walkSimple } from 'acorn-walk';
 
 /**
- * Independent quine verification. A candidate passes when:
- *  1. It contains none of the banned "read your own source" escape hatches.
- *  2. Its source, piped to `node -` over STDIN (CommonJS) from an empty temp
- *     dir with a minimal env, is written byte-for-byte to stdout with exit 0.
+ * Independent quine verification + deterministic work metrics.
  *
- * Running from stdin is the load-bearing defense: during verification the
- * source never exists on disk, so no self-reading technique — however
- * obfuscated — has anything to read. The token blacklist exists on top of
- * that to give the model fast, explainable feedback (and the generator
- * prompt lists the same tokens, so every rejection is actionable).
+ * Validity (verifyQuine): the source, piped to `node -` over STDIN (CommonJS)
+ * from an empty temp dir with a minimal env, must write itself byte-for-byte
+ * to stdout and exit 0. Running from stdin is the load-bearing defense: the
+ * source never exists on disk during the validity run, so no self-reading
+ * trick has anything to read. A token blacklist sits on top for fast,
+ * explainable feedback (the generator prompt lists the same tokens).
+ *
+ * Metrics (evaluateCandidate): candidates must also be computationally dense,
+ * not just long. Two deterministic measures:
+ *  - literalFraction: bytes inside string/template literals ÷ total bytes,
+ *    from the AST (acorn). Caps "grow by pasting a bigger payload".
+ *  - steps: exact V8 block-execution counts from a second, file-based run
+ *    under NODE_V8_COVERAGE (built into Node; no source transformation, so
+ *    toString-based quines are unaffected and stdout stays byte-exact).
+ *    Deterministic because candidates are required to be deterministic (the
+ *    ban list includes random/Date/hrtime/performance).
  */
+
+export interface QuineMetrics {
+  bytes: number;
+  steps: number;
+  literalFraction: number;
+  stepsPerByte: number;
+}
 
 export interface VerifyResult {
   ok: boolean;
   /** Human/model-readable failure explanation, empty on success. */
   reason: string;
   byteLength: number;
+}
+
+export interface EvaluateResult {
+  ok: boolean;
+  reason: string;
+  metrics: QuineMetrics;
+}
+
+export interface Thresholds {
+  /** Byte length the candidate must strictly exceed. */
+  bestBytes: number;
+  /** Executed-step count the candidate must strictly exceed. */
+  bestSteps: number;
 }
 
 const BANNED: Array<{ re: RegExp; label: string }> = [
@@ -37,21 +69,67 @@ const BANNED: Array<{ re: RegExp; label: string }> = [
   { re: /\breadFile\w*\b/, label: 'readFile*' },
   { re: /\bopenSync\b/, label: 'fs.openSync' },
   { re: /\bfs\b/, label: 'fs' },
+  { re: /\bstack\b/, label: 'Error stack introspection' },
   { re: /\bDeno\b/, label: 'Deno' },
   { re: /\bBun\b/, label: 'Bun' },
+  // Determinism: step counts must be reproducible run-to-run.
+  { re: /\brandom\b/, label: 'Math.random (nondeterministic)' },
+  { re: /\bDate\b/, label: 'Date (nondeterministic)' },
+  { re: /\bhrtime\b/, label: 'process.hrtime (nondeterministic)' },
+  { re: /\bperformance\b/, label: 'performance timers (nondeterministic)' },
 ];
 
-const RUN_TIMEOUT_MS = 10_000;
+function intEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+const RUN_TIMEOUT_MS = intEnv('QUINER_RUN_TIMEOUT_MS', 10_000);
 const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
+/** At most this fraction of the file may live inside string/template literals. */
+export const MAX_LITERAL_FRACTION = 0.5;
 
 export function checkBannedTokens(source: string): string | null {
   for (const { re, label } of BANNED) {
     const m = source.match(re);
     if (m) {
-      return `banned token "${m[0]}" (${label}) found — the quine must not read its own source from disk or the runtime environment`;
+      return `banned token "${m[0]}" (${label}) found — the quine must not read its own source, and must be fully deterministic`;
     }
   }
   return null;
+}
+
+/**
+ * Fraction of the source's characters that sit inside string or template
+ * literals (including quotes/backticks). Nested literals inside template
+ * expressions are handled by interval-merging so nothing double-counts.
+ * Throws on syntax errors (with acorn's message).
+ */
+export function literalFraction(source: string): number {
+  if (source.length === 0) return 0;
+  const ast = acorn.parse(source, { ecmaVersion: 'latest', sourceType: 'script' });
+  const spans: Array<[number, number]> = [];
+  walkSimple(ast, {
+    Literal(node: any) {
+      if (typeof node.value === 'string') spans.push([node.start, node.end]);
+    },
+    TemplateLiteral(node: any) {
+      spans.push([node.start, node.end]);
+    },
+  });
+  spans.sort((a, b) => a[0] - b[0]);
+  let covered = 0;
+  let cursor = 0;
+  for (const [start, end] of spans) {
+    const s = Math.max(start, cursor);
+    if (end > s) {
+      covered += end - s;
+      cursor = end;
+    }
+  }
+  return covered / source.length;
 }
 
 /** Render a precise first-difference report for the feedback prompt. */
@@ -78,6 +156,7 @@ export function diffReport(expected: Buffer, actual: Buffer): string {
   return lines.join('\n');
 }
 
+/** Validity only: banned tokens + byte-exact stdin execution. */
 export async function verifyQuine(source: Buffer): Promise<VerifyResult> {
   const byteLength = source.length;
 
@@ -103,46 +182,136 @@ export async function verifyQuine(source: Buffer): Promise<VerifyResult> {
     // Pin CommonJS for any relative resolution, matching the workspace the
     // agent self-tests in (stdin input is CommonJS by default anyway).
     writeFileSync(join(dir, 'package.json'), '{ "type": "commonjs" }\n');
-    const run = await runNodeStdin(source, dir);
-    if (run.timedOut) {
-      return { ok: false, reason: `program did not finish within ${RUN_TIMEOUT_MS}ms`, byteLength };
-    }
-    if (run.tooLarge) {
-      return {
-        ok: false,
-        reason: `program printed more than the ${MAX_OUTPUT_BYTES / (1024 * 1024)} MB output limit`,
-        byteLength,
-      };
-    }
-    if (run.exitCode !== 0) {
-      return {
-        ok: false,
-        reason: `node exited with code ${run.exitCode}${run.stderr ? `; stderr:\n${run.stderr.slice(0, 2000)}` : ''}`,
-        byteLength,
-      };
-    }
-    if (!run.stdout.equals(source)) {
-      return {
-        ok: false,
-        reason: `stdout does not match the source exactly:\n${diffReport(source, run.stdout)}`,
-        byteLength,
-      };
-    }
+    const run = await runNode(['--no-warnings', '-'], dir, source, {});
+    const failure = runFailureReason(run, source);
+    if (failure) return { ok: false, reason: failure, byteLength };
     return { ok: true, reason: '', byteLength };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 }
 
-function runNodeStdin(
+/**
+ * Full gate: validity + literal-fraction cap + deterministic step count +
+ * strict improvement over `thresholds`. This is the single authoritative
+ * check shared by the verify_candidate MCP tool, the workflow, and the
+ * commit-time re-check.
+ */
+export async function evaluateCandidate(source: Buffer, thresholds: Thresholds): Promise<EvaluateResult> {
+  const bytes = source.length;
+  const metrics: QuineMetrics = { bytes, steps: 0, literalFraction: 0, stepsPerByte: 0 };
+  const fail = (reason: string): EvaluateResult => ({ ok: false, reason, metrics });
+
+  // Static checks first (cheap, precise feedback).
+  const validityPrecheck =
+    bytes === 0
+      ? 'candidate is empty'
+      : bytes > MAX_OUTPUT_BYTES
+        ? `candidate is ${bytes} bytes, over the ${MAX_OUTPUT_BYTES / (1024 * 1024)} MB limit`
+        : checkBannedTokens(source.toString('utf-8'));
+  if (validityPrecheck) return fail(validityPrecheck);
+
+  try {
+    metrics.literalFraction = literalFraction(source.toString('utf-8'));
+  } catch (err) {
+    return fail(`source does not parse: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (metrics.literalFraction > MAX_LITERAL_FRACTION) {
+    return fail(
+      `${(metrics.literalFraction * 100).toFixed(1)}% of the file is inside string/template literals — the cap is ${MAX_LITERAL_FRACTION * 100}%. Generate your payload computationally instead of hardcoding it.`,
+    );
+  }
+
+  const validity = await verifyQuine(source);
+  if (!validity.ok) return fail(validity.reason);
+
+  const measured = await measureSteps(source);
+  if (!measured.ok) return fail(measured.reason);
+  metrics.steps = measured.steps;
+  metrics.stepsPerByte = metrics.steps / bytes;
+
+  if (bytes <= thresholds.bestBytes) {
+    return fail(
+      `valid quine, but only ${bytes} bytes — it must be STRICTLY MORE than the current best ${thresholds.bestBytes} bytes`,
+    );
+  }
+  if (metrics.steps <= thresholds.bestSteps) {
+    return fail(
+      `valid quine of ${bytes} bytes, but it executes only ${metrics.steps} steps — it must execute STRICTLY MORE than the current best ${thresholds.bestSteps} steps (V8 block-execution counts). Add real computation (loops, recursion, procedural payload generation), not just more text.`,
+    );
+  }
+
+  return { ok: true, reason: '', metrics };
+}
+
+/**
+ * Deterministic work measurement: run the (already-validated) source from a
+ * file under NODE_V8_COVERAGE and sum the block-execution counts of its
+ * script. stdout is byte-checked again so a program cannot behave differently
+ * in the metrics run without being caught.
+ */
+export async function measureSteps(source: Buffer): Promise<{ ok: boolean; reason: string; steps: number }> {
+  const dir = mkdtempSync(join(tmpdir(), 'quiner-steps-'));
+  const covDir = join(dir, 'coverage');
+  const file = join(dir, `q${randomBytes(6).toString('hex')}.js`);
+  try {
+    writeFileSync(join(dir, 'package.json'), '{ "type": "commonjs" }\n');
+    writeFileSync(file, source);
+    const run = await runNode(['--no-warnings', file], dir, null, { NODE_V8_COVERAGE: covDir });
+    const failure = runFailureReason(run, source);
+    if (failure) return { ok: false, reason: `metrics run failed: ${failure}`, steps: 0 };
+
+    // realpath: V8 records the resolved main-module path, and tmpdir() is a
+    // symlink on macOS (/var -> /private/var).
+    const wanted = pathToFileURL(realpathSync(file)).href;
+    let steps = 0;
+    let found = false;
+    for (const name of readdirSync(covDir)) {
+      if (!name.endsWith('.json')) continue;
+      const report = JSON.parse(readFileSync(join(covDir, name), 'utf-8'));
+      for (const script of report.result ?? []) {
+        if (script.url !== wanted) continue;
+        found = true;
+        for (const fn of script.functions ?? []) {
+          for (const range of fn.ranges ?? []) {
+            steps += range.count ?? 0;
+          }
+        }
+      }
+    }
+    if (!found) return { ok: false, reason: 'metrics run produced no coverage data for the candidate', steps: 0 };
+    return { ok: true, reason: '', steps };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function runFailureReason(
+  run: { exitCode: number; stdout: Buffer; stderr: string; timedOut: boolean; tooLarge: boolean },
   source: Buffer,
+): string | null {
+  if (run.timedOut) return `program did not finish within ${RUN_TIMEOUT_MS}ms`;
+  if (run.tooLarge) return `program printed more than the ${MAX_OUTPUT_BYTES / (1024 * 1024)} MB output limit`;
+  if (run.exitCode !== 0) {
+    return `node exited with code ${run.exitCode}${run.stderr ? `; stderr:\n${run.stderr.slice(0, 2000)}` : ''}`;
+  }
+  if (!run.stdout.equals(source)) {
+    return `stdout does not match the source exactly:\n${diffReport(source, run.stdout)}`;
+  }
+  return null;
+}
+
+function runNode(
+  args: string[],
   cwd: string,
+  stdin: Buffer | null,
+  extraEnv: Record<string, string>,
 ): Promise<{ exitCode: number; stdout: Buffer; stderr: string; timedOut: boolean; tooLarge: boolean }> {
   return new Promise((resolve) => {
-    const proc = spawn(process.execPath, ['--no-warnings', '-'], {
+    const proc = spawn(process.execPath, args, {
       cwd,
-      env: { PATH: process.env.PATH ?? '' },
-      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { PATH: process.env.PATH ?? '', ...extraEnv },
+      stdio: [stdin === null ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     });
 
     const stdoutChunks: Buffer[] = [];
@@ -156,12 +325,14 @@ function runNodeStdin(
       proc.kill('SIGKILL');
     }, RUN_TIMEOUT_MS);
 
-    proc.stdin.on('error', () => {
-      // Program may exit without reading stdin; EPIPE here is fine.
-    });
-    proc.stdin.end(source);
+    if (stdin !== null && proc.stdin) {
+      proc.stdin.on('error', () => {
+        // Program may exit without reading stdin; EPIPE here is fine.
+      });
+      proc.stdin.end(stdin);
+    }
 
-    proc.stdout.on('data', (d: Buffer) => {
+    proc.stdout!.on('data', (d: Buffer) => {
       stdoutBytes += d.length;
       if (stdoutBytes > MAX_OUTPUT_BYTES) {
         tooLarge = true;
@@ -170,7 +341,7 @@ function runNodeStdin(
       }
       stdoutChunks.push(d);
     });
-    proc.stderr.on('data', (d: Buffer) => {
+    proc.stderr!.on('data', (d: Buffer) => {
       if (stderr.length < 10_000) stderr += d.toString();
     });
 

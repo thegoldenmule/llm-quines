@@ -17,6 +17,8 @@
     "@mastra/libsql": "^1.6.4",
     "@mastra/loggers": "^1.0.2",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "acorn": "^8.17.0",
+    "acorn-walk": "^8.3.5",
     "zod": "^4.3.6"
   },
   "devDependencies": {

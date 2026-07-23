@@ -1,8 +1,17 @@
 # quiner
 
-An agent loop that builds ever-larger JavaScript quines. Built on [Mastra](https://mastra.ai)
-workflows, with all LLM calls going through the local **Claude Code CLI in print mode**
-(`claude -p`, same pattern as mastra-hotseat's executor) — no direct Anthropic API calls.
+An agent loop that builds ever-larger, ever-more-computational JavaScript quines. Built on
+[Mastra](https://mastra.ai) workflows, with all LLM calls going through the local **Claude
+Code CLI in print mode** (`claude -p`, same pattern as mastra-hotseat's executor) — no direct
+Anthropic API calls.
+
+Fitness is two-dimensional: each accepted quine must strictly beat the incumbent in **bytes
+AND executed steps** (deterministic V8 block-execution counts via `NODE_V8_COVERAGE`), with
+at most **50% of the file inside string/template literals** (measured on the acorn AST) — so
+"paste a longer payload" is structurally a dead end and growth has to be earned with real
+computation. Candidates must be deterministic (`random`/`Date`/`hrtime`/`performance` are
+banned along with the self-reading tokens). True asymptotic complexity is undecidable; these
+are the deterministic proxies.
 
 ## How it works
 
@@ -24,8 +33,10 @@ Each loop iteration runs a two-step Mastra workflow:
    obfuscation. Failures resume the same claude session with a precise diff report (up to
    `QUINER_MAX_ATTEMPTS` tries; if the session died without an id, the retry restates the full
    task in a fresh session).
-2. **commit-quine** — re-verifies the exact bytes, writes
-   `completed/quine-<seq>-<bytes>b.js`, updates `state.json`, and commits both to git.
+2. **commit-quine** — re-runs the exact gate on the exact bytes, writes
+   `completed/quine-<seq>-<bytes>b-<steps>s.js`, updates `state.json`, and commits both to
+   git. (Legacy files without the `-<steps>s` suffix get their steps measured once at scan
+   time and cached in `state.json`.)
 
 Then the loop goes again, forever.
 

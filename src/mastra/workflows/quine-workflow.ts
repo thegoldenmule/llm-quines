@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { runClaude, type Effort } from '../utils/claude-cli';
-import { verifyQuine } from '../utils/quine';
+import { evaluateCandidate } from '../utils/quine';
 import { PROJECT_ROOT, WORKSPACE_DIR, commitQuine } from '../utils/state';
 import { shutdownRequested, shutdownSignal } from '../utils/shutdown';
 import { SYSTEM_PROMPT, bootstrapPrompt, growPrompt, feedbackPrompt, freshRetryPrompt } from '../prompts';
@@ -26,11 +26,11 @@ const MCP_CONFIG = join(WORKSPACE_DIR, '.quiner-mcp.json');
 
 /**
  * Per-iteration MCP config giving the claude session the `verify_candidate`
- * tool — the same verifier the harness runs, with the current best length
- * baked in — so the agent tests attempts through an explicit tool instead of
+ * tool — the same gate the harness runs, with the current thresholds baked
+ * in — so the agent tests attempts through an explicit tool instead of
  * inventing its own checks.
  */
-function writeMcpConfig(bestLength: number): string {
+function writeMcpConfig(bestBytes: number, bestSteps: number): string {
   writeFileSync(
     MCP_CONFIG,
     JSON.stringify(
@@ -42,7 +42,8 @@ function writeMcpConfig(bestLength: number): string {
             env: {
               PATH: process.env.PATH ?? '',
               QUINER_WORKSPACE: WORKSPACE_DIR,
-              QUINER_BEST_LENGTH: String(bestLength),
+              QUINER_BEST_LENGTH: String(bestBytes),
+              QUINER_BEST_STEPS: String(bestSteps),
             },
           },
         },
@@ -59,30 +60,32 @@ const generateAndVerify = createStep({
   description: 'Ask claude -p for a quine, independently verify it, retry with feedback on failure',
   inputSchema: z.object({
     seq: z.number(),
-    bestLength: z.number(),
+    bestBytes: z.number(),
+    bestSteps: z.number(),
     bestFile: z.string().optional(),
   }),
   outputSchema: z.object({
     seq: z.number(),
-    bestLength: z.number(),
+    bestBytes: z.number(),
+    bestSteps: z.number(),
     sourceB64: z.string(),
   }),
   execute: async ({ inputData }) => {
-    const { seq, bestLength, bestFile } = inputData;
+    const { seq, bestBytes, bestSteps, bestFile } = inputData;
 
     // A stale candidate from a previous iteration must never count.
     rmSync(CANDIDATE, { force: true });
 
-    const mcpConfigPath = writeMcpConfig(bestLength);
+    const mcpConfigPath = writeMcpConfig(bestBytes, bestSteps);
 
     // Read the reference source here rather than receiving it as workflow
     // input, so quine bytes never sit in run snapshots or grow the db.
     const bestSource =
       bestFile && existsSync(bestFile) ? readFileSync(bestFile, 'utf-8') : undefined;
     const firstPrompt =
-      bestFile === undefined || bestLength === 0
+      bestFile === undefined || bestBytes === 0
         ? bootstrapPrompt()
-        : growPrompt(bestLength, bestFile, bestSource);
+        : growPrompt(bestBytes, bestSteps, bestFile, bestSource);
 
     let sessionId: string | undefined;
     let lastFailure = 'no attempts made';
@@ -97,7 +100,7 @@ const generateAndVerify = createStep({
         attempt === 0
           ? firstPrompt
           : sessionId
-            ? feedbackPrompt(lastFailure, bestLength)
+            ? feedbackPrompt(lastFailure, bestBytes, bestSteps)
             : freshRetryPrompt(firstPrompt, lastFailure);
       console.log(`\n[quiner] seq=${seq} attempt ${attempt + 1}/${MAX_ATTEMPTS}${sessionId ? ' (resuming session)' : ''}`);
 
@@ -135,20 +138,18 @@ const generateAndVerify = createStep({
       }
 
       const source = readFileSync(CANDIDATE);
-      const verdict = await verifyQuine(source);
+      const verdict = await evaluateCandidate(source, { bestBytes, bestSteps });
       if (!verdict.ok) {
         lastFailure = verdict.reason;
         console.log(`[quiner] verification failed: ${verdict.reason.split('\n')[0]}`);
         continue;
       }
-      if (verdict.byteLength <= bestLength) {
-        lastFailure = `your program IS a valid quine, but it is only ${verdict.byteLength} bytes — it must be STRICTLY MORE than ${bestLength} bytes`;
-        console.log(`[quiner] valid quine but too short (${verdict.byteLength}b <= ${bestLength}b)`);
-        continue;
-      }
 
-      console.log(`[quiner] verified quine: ${verdict.byteLength} bytes`);
-      return { seq, bestLength, sourceB64: source.toString('base64') };
+      const m = verdict.metrics;
+      console.log(
+        `[quiner] verified quine: ${m.bytes} bytes, ${m.steps} steps (${m.stepsPerByte.toFixed(1)}/byte), ${(m.literalFraction * 100).toFixed(1)}% literal`,
+      );
+      return { seq, bestBytes, bestSteps, sourceB64: source.toString('base64') };
     }
 
     throw new Error(`no verified quine after ${MAX_ATTEMPTS} attempts (last failure: ${lastFailure.split('\n')[0]})`);
@@ -160,40 +161,44 @@ const commitStep = createStep({
   description: 'Re-verify and commit the quine into completed/ with git',
   inputSchema: z.object({
     seq: z.number(),
-    bestLength: z.number(),
+    bestBytes: z.number(),
+    bestSteps: z.number(),
     sourceB64: z.string(),
   }),
   outputSchema: z.object({
     seq: z.number(),
     file: z.string(),
     byteLength: z.number(),
+    steps: z.number(),
   }),
   execute: async ({ inputData }) => {
     const source = Buffer.from(inputData.sourceB64, 'base64');
     // Defense in depth: the bytes we commit are the bytes we verified.
-    const verdict = await verifyQuine(source);
+    const verdict = await evaluateCandidate(source, {
+      bestBytes: inputData.bestBytes,
+      bestSteps: inputData.bestSteps,
+    });
     if (!verdict.ok) throw new Error(`quine failed re-verification at commit time: ${verdict.reason}`);
-    if (verdict.byteLength <= inputData.bestLength) {
-      throw new Error(`quine shrank below best (${verdict.byteLength}b <= ${inputData.bestLength}b) at commit time`);
-    }
-    const { file, byteLength } = commitQuine(source, inputData.seq);
-    console.log(`[quiner] committed ${file} (${byteLength} bytes)`);
-    return { seq: inputData.seq, file, byteLength };
+    const { file, byteLength } = commitQuine(source, inputData.seq, verdict.metrics.steps);
+    console.log(`[quiner] committed ${file} (${byteLength} bytes, ${verdict.metrics.steps} steps)`);
+    return { seq: inputData.seq, file, byteLength, steps: verdict.metrics.steps };
   },
 });
 
 export const quineWorkflow = createWorkflow({
   id: 'quine-workflow',
-  description: 'One iteration of the quine loop: generate a strictly-longer verified quine and commit it',
+  description: 'One iteration of the quine loop: generate a strictly-better verified quine and commit it',
   inputSchema: z.object({
     seq: z.number(),
-    bestLength: z.number(),
+    bestBytes: z.number(),
+    bestSteps: z.number(),
     bestFile: z.string().optional(),
   }),
   outputSchema: z.object({
     seq: z.number(),
     file: z.string(),
     byteLength: z.number(),
+    steps: z.number(),
   }),
   options: {
     // Durable state lives in completed/ + git; snapshots would grow mastra.db

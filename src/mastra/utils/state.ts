@@ -10,12 +10,17 @@ import {
 } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { measureSteps } from './quine';
 
 /**
  * Durable state = the `completed/` folder plus git history. `state.json` is a
- * human-readable cache only; on startup we always rebuild from a scan of
- * `completed/`, so killing the loop at any point loses at most the in-flight
- * iteration.
+ * cache only (it also memoizes measured step counts for legacy files); on
+ * startup we always rebuild from a scan of `completed/`, so killing the loop
+ * at any point loses at most the in-flight iteration.
+ *
+ * The incumbent "best" is the highest-sequence valid file: every accepted
+ * quine must strictly beat its predecessor in BOTH bytes and executed steps,
+ * so the chain is totally ordered and the newest entry dominates.
  */
 
 const __dir = dirname(fileURLToPath(import.meta.url));
@@ -24,14 +29,18 @@ export const COMPLETED_DIR = join(PROJECT_ROOT, 'completed');
 export const WORKSPACE_DIR = join(PROJECT_ROOT, 'workspace');
 export const STATE_FILE = join(PROJECT_ROOT, 'state.json');
 
-const FILE_RE = /^quine-(\d+)-(\d+)b\.js$/;
+// quine-<seq>-<bytes>b[-<steps>s].js — the steps suffix is absent on legacy
+// files committed before the computational-complexity gate existed.
+const FILE_RE = /^quine-(\d+)-(\d+)b(?:-(\d+)s)?\.js$/;
 
 export interface QuinerState {
   /** Sequence number the next quine will get. */
   nextSeq: number;
-  /** Byte length of the current best (largest) verified quine; 0 when none. */
-  bestLength: number;
-  /** Absolute path of the current best quine, if any. */
+  /** Byte length of the incumbent; 0 when none. */
+  bestBytes: number;
+  /** Executed-step count of the incumbent; 0 when none. */
+  bestSteps: number;
+  /** Absolute path of the incumbent, if any. */
   bestFile?: string;
 }
 
@@ -54,11 +63,41 @@ export function ensureDirs(): void {
   }
 }
 
-export function scanState(): QuinerState {
+interface StateCache {
+  bestFile?: string;
+  bestSteps?: number;
+}
+
+function readStateCache(): StateCache {
+  try {
+    const parsed = JSON.parse(readFileSync(STATE_FILE, 'utf-8'));
+    return { bestFile: parsed.bestFile, bestSteps: parsed.bestSteps };
+  } catch {
+    return {};
+  }
+}
+
+function writeStateCache(state: QuinerState): void {
+  writeFileAtomic(
+    STATE_FILE,
+    JSON.stringify(
+      {
+        nextSeq: state.nextSeq,
+        bestFile: state.bestFile,
+        bestBytes: state.bestBytes,
+        bestSteps: state.bestSteps,
+        updatedAt: new Date().toISOString(),
+      },
+      null,
+      2,
+    ) + '\n',
+  );
+}
+
+export async function scanState(): Promise<QuinerState> {
   ensureDirs();
   let nextSeq = 0;
-  let bestLength = 0;
-  let bestFile: string | undefined;
+  let best: { seq: number; bytes: number; steps?: number; path: string } | undefined;
   for (const name of readdirSync(COMPLETED_DIR)) {
     const m = name.match(FILE_RE);
     if (!m) continue;
@@ -72,12 +111,33 @@ export function scanState(): QuinerState {
       console.warn(`[quiner] WARNING: ${name} is ${bytes} bytes but its name claims ${m[2]} — ignoring as best candidate`);
       continue;
     }
-    if (bytes > bestLength) {
-      bestLength = bytes;
-      bestFile = path;
+    if (best === undefined || seq > best.seq) {
+      best = { seq, bytes, steps: m[3] !== undefined ? parseInt(m[3], 10) : undefined, path };
     }
   }
-  return { nextSeq, bestLength, bestFile };
+
+  if (!best) return { nextSeq, bestBytes: 0, bestSteps: 0 };
+
+  let bestSteps = best.steps;
+  if (bestSteps === undefined) {
+    // Legacy file from before the steps gate: measure once, memoized in
+    // state.json so restarts don't pay the run again.
+    const cache = readStateCache();
+    if (cache.bestFile === best.path && typeof cache.bestSteps === 'number') {
+      bestSteps = cache.bestSteps;
+    } else {
+      console.log(`[quiner] measuring steps for legacy best ${best.path}...`);
+      const measured = await measureSteps(readFileSync(best.path));
+      bestSteps = measured.ok ? measured.steps : 0;
+      if (!measured.ok) {
+        console.warn(`[quiner] WARNING: could not measure legacy best (${measured.reason}); treating as 0 steps`);
+      }
+    }
+  }
+
+  const state: QuinerState = { nextSeq, bestBytes: best.bytes, bestSteps, bestFile: best.path };
+  writeStateCache(state);
+  return state;
 }
 
 export function readBestSource(state: QuinerState): string | undefined {
@@ -108,25 +168,22 @@ export function ensureGitRepo(): void {
 }
 
 /** Write the verified quine into completed/, update state.json, git commit. */
-export function commitQuine(source: Buffer, seq: number): { file: string; byteLength: number } {
+export function commitQuine(
+  source: Buffer,
+  seq: number,
+  steps: number,
+): { file: string; byteLength: number } {
   ensureDirs();
   const byteLength = source.length;
-  const name = `quine-${String(seq).padStart(4, '0')}-${byteLength}b.js`;
+  const name = `quine-${String(seq).padStart(4, '0')}-${byteLength}b-${steps}s.js`;
   const path = join(COMPLETED_DIR, name);
   writeFileAtomic(path, source);
-  writeFileAtomic(
-    STATE_FILE,
-    JSON.stringify(
-      { nextSeq: seq + 1, bestLength: byteLength, bestFile: path, updatedAt: new Date().toISOString() },
-      null,
-      2,
-    ) + '\n',
-  );
+  writeStateCache({ nextSeq: seq + 1, bestBytes: byteLength, bestSteps: steps, bestFile: path });
   // `add -A` on the whole folder sweeps in any quine a previous crash left
   // written-but-unstaged, so no completed quine can be lost to git forever.
   git(['add', '-A', '--', COMPLETED_DIR, STATE_FILE]);
   // --no-verify/--no-gpg-sign: a global hook or gpg config must not be able
   // to wedge the loop.
-  git(['commit', '--no-verify', '--no-gpg-sign', '-m', `quine #${seq}: ${byteLength} bytes`]);
+  git(['commit', '--no-verify', '--no-gpg-sign', '-m', `quine #${seq}: ${byteLength} bytes, ${steps} steps`]);
   return { file: path, byteLength };
 }

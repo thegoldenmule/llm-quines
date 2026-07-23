@@ -99,9 +99,9 @@ async function main(): Promise<void> {
   let consecutiveFailures = 0;
 
   while (!shutdownRequested() && iterations < MAX_ITERATIONS) {
-    const state = scanState();
+    const state = await scanState();
     console.log(
-      `\n[quiner] ── iteration ${state.nextSeq} ── best so far: ${state.bestLength > 0 ? `${state.bestLength} bytes (${state.bestFile})` : 'none'}`,
+      `\n[quiner] ── iteration ${state.nextSeq} ── best so far: ${state.bestBytes > 0 ? `${state.bestBytes} bytes / ${state.bestSteps} steps (${state.bestFile})` : 'none'}`,
     );
 
     try {
@@ -110,14 +110,15 @@ async function main(): Promise<void> {
       const result = await run.start({
         inputData: {
           seq: state.nextSeq,
-          bestLength: state.bestLength,
+          bestBytes: state.bestBytes,
+          bestSteps: state.bestSteps,
           bestFile: state.bestFile,
         },
       });
 
       if (result.status === 'success') {
         consecutiveFailures = 0;
-        console.log(`[quiner] ✓ quine #${result.result.seq} complete: ${result.result.byteLength} bytes → ${result.result.file}`);
+        console.log(`[quiner] ✓ quine #${result.result.seq} complete: ${result.result.byteLength} bytes, ${result.result.steps} steps → ${result.result.file}`);
       } else {
         consecutiveFailures++;
         const error = result.status === 'failed' ? result.error : `workflow ended with status ${result.status}`;
